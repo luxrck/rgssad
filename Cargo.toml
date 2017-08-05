@@ -1,0 +1,6 @@
+[package]
+name = "rgssad"
+version = "0.1.0"
+authors = ["lux.r.ck <lux.r.ck@gmail.com>"]
+
+[dependencies]
