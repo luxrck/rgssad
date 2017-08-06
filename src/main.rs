@@ -12,6 +12,8 @@ use std::env;
 use std::cmp;
 use std::path::Path;
 
+static __VERSION__: &str = "0.1.2";
+
 fn advance_magic(magic: &mut u32) -> u32 {
     let old = *magic;
     *magic = magic.wrapping_mul(7) + 3;
@@ -32,7 +34,6 @@ fn ru32(stream: &mut File, result: &mut u32) -> bool {
     return true;
 }
 
-#[derive(Clone, Copy)]
 struct EntryData {
     offset: u32,
     magic: u32,
@@ -65,13 +66,15 @@ impl Entry {
 
         if maski != 0 { return count; }
 
-        for _ in 0..((count - pre)/4) {
-            buf[offset + 0] ^= (self.magic & 0xff) as u8;
-            buf[offset + 1] ^= ((self.magic >> 8) & 0xff) as u8;
-            buf[offset + 2] ^= ((self.magic >> 16) & 0xff) as u8;
-            buf[offset + 3] ^= ((self.magic >> 24) & 0xff) as u8;
-            offset += 4;
-            advance_magic(&mut self.magic);
+        unsafe {
+            let len = (count - pre) / 4;
+            let dat = buf[..len*4].as_mut_ptr() as *mut u32;
+
+            for i in 0..(len as isize) {
+                *dat.offset(i) = *dat.offset(i) ^ advance_magic(&mut self.magic);
+            }
+
+            offset += len * 4;
         }
 
         for _ in 0..(count%4) {
@@ -102,6 +105,7 @@ impl RGSSArchive {
         match String::from_utf8(header[..6].to_vec()) {
             Ok(header) => {
                 if header != "RGSSAD" {
+                    return Err(Error::new(ErrorKind::InvalidData, "File header mismatch."));
                 }
             },
             Err(_) => return Err(Error::new(ErrorKind::InvalidData, "File header mismatch."))
@@ -210,10 +214,11 @@ impl RGSSArchive {
 }
 
 fn usage() {
-    println!("Extract rgssad/rgss2a/rgss3a files.");
+    println!("Extract rgssad/rgss2a/rgss3a files.\n");
     println!("Commands:");
-    println!("\tlist\t<filename>");
-    println!("\tsave\t<filename> <location>");
+    println!("    version");
+    println!("    list        <filename>");
+    println!("    save        <filename> <location>");
 }
 
 fn create(location: String) -> File {
@@ -225,7 +230,11 @@ fn create(location: String) -> File {
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.len() {
-        1...2 => usage(),
+        1 => usage(),
+        2 => {
+            if args[1] != "version" { usage(); return; }
+            println!("version: {}", __VERSION__);
+        },
         3 => {
             if args[1] != "list" { usage(); return; }
             match RGSSArchive::open(args[2].as_str()) {
@@ -246,7 +255,7 @@ fn main() {
             let archive = archive.unwrap();
             let entries = archive.entry.iter();
 
-            let mut buf = [0u8; 1024];
+            let mut buf = [0u8; 8192];
 
             for (name, _) in entries {
                 println!("Extracting: {}", name);
@@ -255,7 +264,7 @@ fn main() {
                 loop {
                     let count = entry.read(&mut buf);
                     if count == 0 { break }
-                    if count < 1024 {
+                    if count < buf.len() {
                         file.write(&buf[..count]).unwrap();
                     } else {
                         file.write(&buf).unwrap();
