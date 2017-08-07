@@ -264,11 +264,7 @@ fn main() {
                 loop {
                     let count = entry.read(&mut buf);
                     if count == 0 { break }
-                    if count < buf.len() {
-                        file.write(&buf[..count]).unwrap();
-                    } else {
-                        file.write(&buf).unwrap();
-                    }
+                    file.write(&buf[..count]).unwrap();
                 }
             }
         },
