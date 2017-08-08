@@ -1,2 +1,5 @@
 /target/
 **/*.rs.bk
+*.rgssad
+*.rgss2a
+*.rgss3a

@@ -97,15 +97,20 @@ impl RGSSArchive {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header)?;
 
-        if let Err(_) | (Ok(header) if header != "RGSSAD") = String::from_utf8(header[..6].to_vec()) {
-            return Err(Error::new(ErrorKind::InvalidData, "File header mismatch."));
+        match String::from_utf8(header[..6].to_vec()) {
+            Ok(h) => {
+                if h != "RGSSAD" {
+                    return Err(Error::new(ErrorKind::InvalidData, "Input file header mismatch."));
+                }
+            },
+            Err(_) => return Err(Error::new(ErrorKind::InvalidData, "Input file header mismatch."))
         }
-        
+
         // Check rgssad file version.
-        match header[7] {
-            1..2 => RGSSArchive::open_rgssad(stream),
-               3 => RGSSArchive::open_rgss3a(stream),
-               _ => Err(Error::new(ErrorKind::InvalidData, format!("RGSSArchive file version:{} is not support.", header[7])),
+        return match header[7] {
+            1|2 => RGSSArchive::open_rgssad(stream),
+              3 => RGSSArchive::open_rgss3a(stream),
+              _ => Err(Error::new(ErrorKind::InvalidData, format!("RGSSArchive file version:{} is not support.", header[7]))),
         }
     }
 
@@ -115,8 +120,7 @@ impl RGSSArchive {
 
         loop {
             let mut name_len: u32 = 0;
-            let resp = ru32(&mut stream, &mut name_len);
-            if !resp { break }
+            if !ru32(&mut stream, &mut name_len) { break }
             name_len ^= advance_magic(&mut magic);
 
             let mut name_buf = vec![0u8; name_len as usize];
@@ -148,7 +152,7 @@ impl RGSSArchive {
         let mut entry = HashMap::new();
 
         if !ru32(&mut stream, &mut magic) {
-            return Err::New(ErrorKind::InvalidData, format!("Magic number read failed, {:?}",));
+            return Err(Error::new(ErrorKind::InvalidData, format!("Magic number read failed.")));
         }
         magic = magic * 9 + 3;
 
@@ -158,22 +162,18 @@ impl RGSSArchive {
             let mut start_magic: u32 = 0;
             let mut name_len: u32 = 0;
 
-            let resp = ru32(&mut stream, &mut offset);
-            if !resp { break }
+            if !ru32(&mut stream, &mut offset) { break };
             offset ^= magic;
 
             if offset == 0 { break }
 
-            let resp = ru32(&mut stream, &mut size);
-            if !resp { break }
+            if !ru32(&mut stream, &mut size) { break }
             size ^= magic;
 
-            let resp = ru32(&mut stream, &mut start_magic);
-            if !resp { break }
+            if !ru32(&mut stream, &mut start_magic) { break}
             start_magic ^= magic;
 
-            let resp = ru32(&mut stream, &mut name_len);
-            if !resp { break }
+            if !ru32(&mut stream, &mut name_len) { break }
             name_len ^= magic;
 
             let mut name_buf = vec![0u8; name_len as usize];
@@ -197,7 +197,7 @@ impl RGSSArchive {
         return Ok(RGSSArchive { entry: entry, stream: stream });
     }
 
-    fn read_entry(&self, key: &str) -> Reault<Entry, Error> {
+    fn read_entry(&self, key: &str) -> Result<Entry, Error> {
         match self.entry.get(key) {
             Some(entry) => {
                 let mut stream = self.stream.try_clone()?;
@@ -208,7 +208,7 @@ impl RGSSArchive {
                     stream: stream.take(entry.size as u64),
                 })
             }
-            None => Err::New(ErrorKind::InvalidData, "key not found."),
+            None => Err(Error::new(ErrorKind::InvalidData, "Key not found.")),
         }
     }
 }
@@ -237,38 +237,41 @@ fn main() {
         },
         3 => {
             if args[1] != "list" { usage(); return; }
-            match RGSSArchive::open(args[2].as_str()) {
-                Ok(archive) => {
-                    for (name, data) in &archive.entry {
-                        println!("{}: EntryData {{ size: {}, offset: {}, magic: {} }}", name, data.size, data.offset, data.magic);
-                    }
-                },
-                Err(err) => println!("FAILED: {}", err.to_string())
+            let archive = RGSSArchive::open(args[2].as_str());
+            if let Err(err) = archive {
+                println!("FAILED: file parse failed, {}", err.to_string()); return;
+            }
+            let archive = archive.unwrap();
+
+            for (name, data) in &archive.entry {
+                println!("{}: EntryData {{ size: {}, offset: {}, magic: {} }}", name, data.size, data.offset, data.magic);
             }
         },
         4 => {
             if args[1] != "save" { usage(); return; }
             let archive = RGSSArchive::open(args[2].as_str());
             if let Err(err) = archive {
-                println!("FAILED: {}", err.to_string()); return;
+                println!("FAILED: file parse failed, {}", err.to_string()); return;
             }
-            let archive = archive.ok();
+            let archive = archive.unwrap();
             let entries = archive.entry.iter();
 
             let mut buf = [0u8; 8192];
 
             for (name, _) in entries {
                 println!("Extracting: {}", name);
-                let mut entry = archive.read_entry(name);
+                let entry = archive.read_entry(name);
                 if let Err(err) = entry {
-                    println!("FAILED: {}", err.to_string()); return;
+                    println!("FAILED: read entry failed, {}", err.to_string()); return;
                 }
-                let entry = entry.ok();
+                let mut entry = entry.unwrap();
                 let mut file = create(args[3].clone() + &"/".to_string() + &name.to_string());
                 loop {
                     let count = entry.read(&mut buf);
                     if count == 0 { break }
-                    file.write(&buf[..count]).unwrap();
+                    if let Err(err) = file.write(&buf[..count]) {
+                        println!("FAILED: key save failed, {}", err.to_string()); return;
+                    }
                 }
             }
         },
