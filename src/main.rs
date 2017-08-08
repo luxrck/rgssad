@@ -77,13 +77,8 @@ impl Entry {
             offset += len * 4;
         }
 
-        for _ in 0..(count%4) {
-            buf[offset] ^= ((self.magic >> (maski * 8)) & 0xff) as u8;
-            maski += 1; offset += 1;
-            if maski % 4 == 0 {
-                advance_magic(&mut self.magic);
-                maski = 0;
-            }
+        for i in 0..(count%4) {
+            buf[offset + i] ^= ((self.magic >> (maski * 8)) & 0xff) as u8;
         }
 
         return count;
@@ -102,17 +97,16 @@ impl RGSSArchive {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header)?;
 
-        match String::from_utf8(header[..6].to_vec()) {
-            Ok(header) => {
-                if header != "RGSSAD" {
-                    return Err(Error::new(ErrorKind::InvalidData, "File header mismatch."));
-                }
-            },
-            Err(_) => return Err(Error::new(ErrorKind::InvalidData, "File header mismatch."))
+        if let Err(_) | (Ok(header) if header != "RGSSAD") = String::from_utf8(header[..6].to_vec()) {
+            return Err(Error::new(ErrorKind::InvalidData, "File header mismatch."));
         }
-
+        
         // Check rgssad file version.
-        if header[7] < 3 { RGSSArchive::open_rgssad(stream) } else { RGSSArchive::open_rgss3a(stream) }
+        match header[7] {
+            1..2 => RGSSArchive::open_rgssad(stream),
+               3 => RGSSArchive::open_rgss3a(stream),
+               _ => Err(Error::new(ErrorKind::InvalidData, format!("RGSSArchive file version:{} is not support.", header[7])),
+        }
     }
 
     fn open_rgssad(mut stream: File) -> Result<RGSSArchive, Error> {
@@ -131,7 +125,9 @@ impl RGSSArchive {
                 name_buf[i] ^= (advance_magic(&mut magic) & 0xff) as u8;
                 if name_buf[i] == '\\' as u8 { name_buf[i] = '/' as u8 }
             }
-            let name_buf = String::from_utf8(name_buf).unwrap();
+            let name_buf = String::from_utf8(name_buf);
+            if let Err(_) = name_buf { break }
+            let name_buf = name_buf.unwrap();
 
             let mut data = EntryData { size: 0, offset: 0, magic: 0 };
             ru32(&mut stream, &mut data.size);
@@ -151,7 +147,9 @@ impl RGSSArchive {
         let mut magic = 0u32;
         let mut entry = HashMap::new();
 
-        ru32(&mut stream, &mut magic);
+        if !ru32(&mut stream, &mut magic) {
+            return Err::New(ErrorKind::InvalidData, format!("Magic number read failed, {:?}",));
+        }
         magic = magic * 9 + 3;
 
         loop {
@@ -184,7 +182,9 @@ impl RGSSArchive {
                 name_buf[i] ^= ((magic >> 8*(i%4)) & 0xff) as u8;
                 if name_buf[i] == '\\' as u8 { name_buf[i] = '/' as u8 }
             }
-            let name_buf = String::from_utf8(name_buf).unwrap();
+            let name_buf = String::from_utf8(name_buf);
+            if let Err(_) = name_buf { break }
+            let name_buf = name_buf.unwrap();
 
             let data = EntryData {
                 size: size, offset: offset, magic: start_magic
@@ -197,18 +197,18 @@ impl RGSSArchive {
         return Ok(RGSSArchive { entry: entry, stream: stream });
     }
 
-    fn read_entry(&self, key: &str) -> Option<Entry> {
+    fn read_entry(&self, key: &str) -> Reault<Entry, Error> {
         match self.entry.get(key) {
             Some(entry) => {
-                let mut stream = self.stream.try_clone().unwrap();
-                stream.seek(SeekFrom::Start(entry.offset as u64)).unwrap();
-                Some(Entry {
+                let mut stream = self.stream.try_clone()?;
+                stream.seek(SeekFrom::Start(entry.offset as u64))?;
+                Ok(Entry {
                     offset: 0,
                     magic: entry.magic,
                     stream: stream.take(entry.size as u64),
                 })
             }
-            None => None
+            None => Err::New(ErrorKind::InvalidData, "key not found."),
         }
     }
 }
@@ -252,14 +252,18 @@ fn main() {
             if let Err(err) = archive {
                 println!("FAILED: {}", err.to_string()); return;
             }
-            let archive = archive.unwrap();
+            let archive = archive.ok();
             let entries = archive.entry.iter();
 
             let mut buf = [0u8; 8192];
 
             for (name, _) in entries {
                 println!("Extracting: {}", name);
-                let mut entry = archive.read_entry(name).unwrap();
+                let mut entry = archive.read_entry(name);
+                if let Err(err) = entry {
+                    println!("FAILED: {}", err.to_string()); return;
+                }
+                let entry = entry.ok();
                 let mut file = create(args[3].clone() + &"/".to_string() + &name.to_string());
                 loop {
                     let count = entry.read(&mut buf);
