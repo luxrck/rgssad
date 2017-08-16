@@ -12,6 +12,9 @@ use std::env;
 use std::cmp;
 use std::path::Path;
 
+extern crate regex;
+use regex::Regex;
+
 static __VERSION__: &str = "0.1.2";
 
 fn advance_magic(magic: &mut u32) -> u32 {
@@ -91,6 +94,17 @@ struct RGSSArchive {
 }
 
 impl RGSSArchive {
+    // fn create(location: &str, version: u8) -> Result<RGSSArchive, Error> {
+    //     let stream = File::create(location)?;
+    //     if version < 1 || version > 3 {
+    //         return Err(Error::new(ErrorKind::InvalidData, "Invalid version."));
+    //     }
+    //
+    //     stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version]);
+    //
+    //     Ok(RGSSArchive { entry: HashMap::new(), stream: stream })
+    // }
+
     fn open(location: &str) -> Result<RGSSArchive, Error> {
         let mut stream = File::open(location)?;
 
@@ -214,11 +228,12 @@ impl RGSSArchive {
 }
 
 fn usage() {
-    println!("Extract rgssad/rgss2a/rgss3a files.\n");
-    println!("Commands:");
-    println!("    version");
-    println!("    list        <filename>");
-    println!("    save        <filename> <location>");
+    println!("Extract rgssad/rgss2a/rgss3a files.
+Commands:
+    help
+    version
+    list        file
+    unpack      file output [filter]");
 }
 
 fn create(location: String) -> File {
@@ -227,53 +242,93 @@ fn create(location: String) -> File {
     return File::create(path.to_str().unwrap()).unwrap();
 }
 
+fn list(archive: RGSSArchive) {
+    for (name, data) in archive.entry {
+        println!("{}: EntryData {{ size: {}, offset: {}, magic: {} }}", name, data.size, data.offset, data.magic);
+    }
+}
+
+// fn pack(dir, out: &str, version: u8) -> io::Result<()> {
+//     let dir = Path::new(dir);
+//     if !dir.is_dir() {
+//         println!("FAILED: input is not a dir."); return;
+//     }
+//     let archive = RGSSArchive::create(out, version);
+//     if let Err(err) = archive {
+//         println!("FAILED: {}", err.to_string()); return;
+//     }
+//     let archive = archive.unwrap();
+//
+//     let visit = |d: &Path| {
+//         for entry in fs::read_dir(&dir)? {
+//             let entry = entry?;
+//             let path = entry.path();
+//             if path.is_dir() {
+//                 visit(&path);
+//             } else {
+//
+//             }
+//         }
+//     }
+// }
+
+fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
+    let entries = archive.entry.iter();
+    let filter = match Regex::new(filter) {
+        Ok(re) => re,
+        Err(_) => Regex::new("*").unwrap(),
+    };
+
+    let mut buf = [0u8; 8192];
+
+    for (name, _) in entries {
+        if !filter.is_match(name) { continue }
+
+        println!("Extracting: {}", name);
+        let entry = archive.read_entry(name);
+        if let Err(err) = entry {
+            println!("FAILED: read entry failed, {}", err.to_string()); return;
+        }
+        let mut entry = entry.unwrap();
+
+        let mut file = create(dir.to_string() + &"/".to_string() + &name.to_string());
+        loop {
+            let count = entry.read(&mut buf);
+            if count == 0 { break }
+            if let Err(err) = file.write(&buf[..count]) {
+                println!("FAILED: key save failed, {}", err.to_string()); return;
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
-    match args.len() {
-        1 => usage(),
-        2 => {
-            if args[1] != "version" { usage(); return; }
+    if args.len() < 2 { usage(); return }
+    match args[1].as_str() {
+        "help" => usage(),
+        "version" => {
+            assert!(args.len() == 2);
             println!("version: {}", __VERSION__);
         },
-        3 => {
-            if args[1] != "list" { usage(); return; }
+        "list" => {
+            assert!(args.len() == 3);
             let archive = RGSSArchive::open(args[2].as_str());
             if let Err(err) = archive {
                 println!("FAILED: file parse failed, {}", err.to_string()); return;
             }
             let archive = archive.unwrap();
 
-            for (name, data) in &archive.entry {
-                println!("{}: EntryData {{ size: {}, offset: {}, magic: {} }}", name, data.size, data.offset, data.magic);
-            }
+            list(archive);
         },
-        4 => {
-            if args[1] != "save" { usage(); return; }
+        "unpack" => {
+            assert!(args.len() > 3 && args.len() < 6);
             let archive = RGSSArchive::open(args[2].as_str());
             if let Err(err) = archive {
                 println!("FAILED: file parse failed, {}", err.to_string()); return;
             }
             let archive = archive.unwrap();
-            let entries = archive.entry.iter();
-
-            let mut buf = [0u8; 8192];
-
-            for (name, _) in entries {
-                println!("Extracting: {}", name);
-                let entry = archive.read_entry(name);
-                if let Err(err) = entry {
-                    println!("FAILED: read entry failed, {}", err.to_string()); return;
-                }
-                let mut entry = entry.unwrap();
-                let mut file = create(args[3].clone() + &"/".to_string() + &name.to_string());
-                loop {
-                    let count = entry.read(&mut buf);
-                    if count == 0 { break }
-                    if let Err(err) = file.write(&buf[..count]) {
-                        println!("FAILED: key save failed, {}", err.to_string()); return;
-                    }
-                }
-            }
+            unpack(archive, args[3].as_str(), (if args.len() == 5 { args[4].as_str() } else { "*" }));
         },
         _ => usage(),
     }
