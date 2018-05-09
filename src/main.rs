@@ -15,7 +15,14 @@ use std::path::Path;
 extern crate regex;
 use regex::Regex;
 
-static __VERSION__: &str = "0.1.2";
+static __VERSION__: &str = "0.1.4";
+
+// Errors
+static E_INVALIDHDR: &str = "Input file header mismatch.";
+static E_INVALIDVER: &str = "Not supported version.";
+static E_INVALIDMGC: &str = "Magic number read failed.";
+static E_INVALIDKEY: &str = "Key not found.";
+
 
 fn advance_magic(magic: &mut u32) -> u32 {
     let old = *magic;
@@ -37,11 +44,27 @@ fn ru32(stream: &mut File, result: &mut u32) -> bool {
     return true;
 }
 
+fn wu32(stream: &mut File, data: &u32) -> bool {
+    let mut buff = [0u8; 4];
+
+    buff[0] = (data & 0x000000FF) as u8;
+    buff[1] = ((data & 0x0000FF00) >> 0x08) as u8;
+    buff[2] = ((data & 0x00FF0000) >> 0x10) as u8;
+    buff[3] = ((data & 0xFF000000) >> 0x18) as u8;
+
+    if let Err(_) = stream.write_all(&buff[..]) {
+        return false;
+    }
+
+    return true;
+}
+
 struct EntryData {
     offset: u32,
     magic: u32,
     size: u32,
 }
+
 
 struct Entry {
     offset: u32,
@@ -50,6 +73,10 @@ struct Entry {
 }
 
 impl Entry {
+    fn write(&mut self, buf: &Take<File>) {
+
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> usize {
         let mut maski = self.offset % 4;
         let mut offset = 0;
@@ -88,24 +115,27 @@ impl Entry {
     }
 }
 
+
 struct RGSSArchive {
+    magic: u32,
+    version: u8,
     entry: HashMap<String, EntryData>,
     stream: File,
 }
 
 impl RGSSArchive {
-    // fn create(location: &str, version: u8) -> Result<RGSSArchive, Error> {
-    //     let stream = File::create(location)?;
-    //     if version < 1 || version > 3 {
-    //         return Err(Error::new(ErrorKind::InvalidData, "Invalid version."));
-    //     }
-    //
-    //     stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version]);
-    //
-    //     Ok(RGSSArchive { entry: HashMap::new(), stream: stream })
-    // }
+    fn create(location: &str, version: u8) -> Result<Self, Error> {
+        let mut stream = File::create(location)?;
+        if version < 1 || version > 3 {
+            return Err(Error::new(ErrorKind::InvalidData, E_INVALIDVER));
+        }
 
-    fn open(location: &str) -> Result<RGSSArchive, Error> {
+        stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version]);
+
+        Ok(RGSSArchive { magic: if version == 3 { 0u32 } else { 0xDEADCAFEu32 }, version: version, entry: HashMap::<String, EntryData>::new(), stream: stream })
+    }
+
+    fn open(location: &str) -> Result<Self, Error> {
         let mut stream = File::open(location)?;
 
         let mut header = [0u8; 8];
@@ -114,21 +144,21 @@ impl RGSSArchive {
         match String::from_utf8(header[..6].to_vec()) {
             Ok(h) => {
                 if h != "RGSSAD" {
-                    return Err(Error::new(ErrorKind::InvalidData, "Input file header mismatch."));
+                    return Err(Error::new(ErrorKind::InvalidData, E_INVALIDHDR));
                 }
             },
-            Err(_) => return Err(Error::new(ErrorKind::InvalidData, "Input file header mismatch."))
+            Err(_) => return Err(Error::new(ErrorKind::InvalidData, E_INVALIDHDR))
         }
 
         // Check rgssad file version.
         return match header[7] {
-            1|2 => RGSSArchive::open_rgssad(stream),
-              3 => RGSSArchive::open_rgss3a(stream),
-              _ => Err(Error::new(ErrorKind::InvalidData, format!("RGSSArchive file version:{} is not support.", header[7]))),
+            1|2 => RGSSArchive::open_rgssad(stream, header[7]),
+              3 => RGSSArchive::open_rgss3a(stream, header[7]),
+              _ => Err(Error::new(ErrorKind::InvalidData, E_INVALIDVER)),
         }
     }
 
-    fn open_rgssad(mut stream: File) -> Result<RGSSArchive, Error> {
+    fn open_rgssad(mut stream: File, version: u8) -> Result<Self, Error> {
         let mut magic = 0xDEADCAFEu32;
         let mut entry = HashMap::new();
 
@@ -158,15 +188,15 @@ impl RGSSArchive {
         }
 
         stream.seek(SeekFrom::Start(0))?;
-        return Ok(RGSSArchive { entry: entry, stream: stream });
+        return Ok(RGSSArchive { magic: magic, version: version, entry: entry, stream: stream });
     }
 
-    fn open_rgss3a(mut stream: File) -> Result<RGSSArchive, Error> {
+    fn open_rgss3a(mut stream: File, version: u8) -> Result<Self, Error> {
         let mut magic = 0u32;
         let mut entry = HashMap::new();
 
         if !ru32(&mut stream, &mut magic) {
-            return Err(Error::new(ErrorKind::InvalidData, format!("Magic number read failed.")));
+            return Err(Error::new(ErrorKind::InvalidData, E_INVALIDMGC));
         }
         magic = magic * 9 + 3;
 
@@ -208,10 +238,10 @@ impl RGSSArchive {
         }
 
         stream.seek(SeekFrom::Start(0))?;
-        return Ok(RGSSArchive { entry: entry, stream: stream });
+        return Ok(RGSSArchive {magic: magic, version: version, entry: entry, stream: stream });
     }
 
-    fn read_entry(&self, key: &str) -> Result<Entry, Error> {
+    fn get_key(&self, key: &str) -> Result<Entry, Error> {
         match self.entry.get(key) {
             Some(entry) => {
                 let mut stream = self.stream.try_clone()?;
@@ -222,24 +252,26 @@ impl RGSSArchive {
                     stream: stream.take(entry.size as u64),
                 })
             }
-            None => Err(Error::new(ErrorKind::InvalidData, "Key not found.")),
+            None => Err(Error::new(ErrorKind::InvalidData, E_INVALIDKEY)),
         }
     }
+
+    // fn put_key(&self, key: &str, stream: &mut File) -> Result<Entry, Error> {
+    //     match self.version {
+    //         1|2 => self.put_key_rgssad(stream),
+    //           3 => self.put_key_rgss3a(stream),
+    //     }
+    // }
 }
+
 
 fn usage() {
     println!("Extract rgssad/rgss2a/rgss3a files.
 Commands:
     help
     version
-    list        file
-    unpack      file output [filter]");
-}
-
-fn create(location: String) -> File {
-    let path = Path::new(location.as_str());
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    return File::create(path.to_str().unwrap()).unwrap();
+    list        <filename>
+    unpack      <filename> <location> [<filter>]");
 }
 
 fn list(archive: RGSSArchive) {
@@ -248,35 +280,50 @@ fn list(archive: RGSSArchive) {
     }
 }
 
-// fn pack(dir, out: &str, version: u8) -> io::Result<()> {
-//     let dir = Path::new(dir);
-//     if !dir.is_dir() {
-//         println!("FAILED: input is not a dir."); return;
-//     }
-//     let archive = RGSSArchive::create(out, version);
-//     if let Err(err) = archive {
-//         println!("FAILED: {}", err.to_string()); return;
-//     }
-//     let archive = archive.unwrap();
-//
-//     let visit = |d: &Path| {
-//         for entry in fs::read_dir(&dir)? {
-//             let entry = entry?;
-//             let path = entry.path();
-//             if path.is_dir() {
-//                 visit(&path);
-//             } else {
-//
-//             }
-//         }
-//     }
-// }
+fn pack(src: &str, out: &str, version: u8) {
+    fn walkdir(archive: &mut RGSSArchive, d: &Path, r: &Path) {
+        for entry in fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                walkdir(archive, &path, r);
+            } else {
+                let key = path.strip_prefix(r).unwrap().to_str().unwrap();
+                let mut stream = File::open(&path).unwrap();
+
+                // TODO: implement this.
+                //archive.put_key(key, stream);
+            }
+        }
+    };
+
+    let root = Path::new(src);
+    if !root.is_dir() {
+        println!("FAILED: source is not a directory."); return
+    }
+
+    let mut archive = match RGSSArchive::create(out, version) {
+        Ok(x) => x,
+        Err(e) => {
+            println!("FAILED: unable to create output file. {}", e); return
+        }
+    };
+    walkdir(&mut archive, root, root);
+}
 
 fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
+    fn create(location: String) -> File {
+        let path = Path::new(location.as_str());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        return File::create(path.to_str().unwrap()).unwrap();
+    }
+
     let entries = archive.entry.iter();
     let filter = match Regex::new(filter) {
         Ok(re) => re,
-        Err(_) => Regex::new("*").unwrap(),
+        Err(_) => {
+            println!("FAILED: Invalid regex filter: {}", filter); return
+        }
     };
 
     let mut buf = [0u8; 8192];
@@ -285,7 +332,7 @@ fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
         if !filter.is_match(name) { continue }
 
         println!("Extracting: {}", name);
-        let entry = archive.read_entry(name);
+        let entry = archive.get_key(name);
         if let Err(err) = entry {
             println!("FAILED: read entry failed, {}", err.to_string()); return;
         }
@@ -328,7 +375,20 @@ fn main() {
                 println!("FAILED: file parse failed, {}", err.to_string()); return;
             }
             let archive = archive.unwrap();
-            unpack(archive, args[3].as_str(), (if args.len() == 5 { args[4].as_str() } else { "*" }));
+            unpack(archive, args[3].as_str(), if args.len() == 5 { args[4].as_str() } else { ".*" });
+        },
+        "pack" => {
+            assert!(args.len() > 3 && args.len() < 6);
+            let mut version = 1u8;
+            if args.len() == 5 {
+                version = match args[4].parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        println!("FAILED: {}", E_INVALIDVER); return
+                    }
+                }
+            };
+            pack(args[2].as_str(), args[3].as_str(), version);
         },
         _ => usage(),
     }

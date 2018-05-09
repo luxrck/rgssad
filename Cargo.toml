@@ -1,7 +1,7 @@
 [package]
 name = "rgssad"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["lux.r.ck <lux.r.ck@gmail.com>"]
 
 [dependencies]
-regex = "*"
+regex = "1.0.0"
