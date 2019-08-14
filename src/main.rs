@@ -109,6 +109,7 @@ impl Entry {
 
         for i in 0..(count%4) {
             buf[offset + i] ^= ((self.magic >> (maski * 8)) & 0xff) as u8;
+            maski += 1;
         }
 
         return count;
