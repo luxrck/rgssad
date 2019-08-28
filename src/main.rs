@@ -9,7 +9,6 @@ use std::io::Error;
 use std::io::ErrorKind;
 use std::collections::HashMap;
 use std::env;
-use std::cmp;
 use std::path::Path;
 
 extern crate regex;
@@ -59,6 +58,19 @@ fn wu32(stream: &mut File, data: &u32) -> bool {
     return true;
 }
 
+/// Calls read until the buffer is full or EOF.
+fn read_until_full(stream: &mut Take<File>, buf: &mut [u8]) -> Result<usize, Error> {
+    let mut nb = 0;
+    loop {
+        match stream.read(&mut buf[nb..]) {
+            Ok(0) => return Ok(nb),
+            Ok(n) => nb += n,
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 struct EntryData {
     offset: u32,
     magic: u32,
@@ -78,41 +90,26 @@ impl Entry {
     }
 
     fn read(&mut self, buf: &mut [u8]) -> usize {
-        let mut maski = self.offset % 4;
-        let mut offset = 0;
-        let count = self.stream.read(buf).unwrap();
-        let pre = ((4 - maski) % 4) as usize;
+        let count = read_until_full(&mut self.stream, buf).unwrap();
+        if count == 0 { return 0; }
+        let buf = &mut buf[..count];
+
+        let (prefix, middle, suffix) = unsafe { buf.align_to_mut::<u32>() };
+        assert!(prefix.len() == 0); // assume buf is aligned
+        assert!(self.offset % 4 == 0);
+
+        for i in 0..middle.len() {
+            let mut w = u32::from_le(middle[i]);
+            w ^= advance_magic(&mut self.magic);
+            middle[i] = w.to_le();
+        }
+
+        for i in 0..suffix.len() {
+            suffix[i] ^= (self.magic >> (i * 8)) as u8;
+        }
 
         self.offset += count as u32;
-
-        for _ in 0..cmp::min(pre, count) {
-            buf[offset] ^= ((self.magic >> (maski * 8)) & 0xff) as u8;
-            maski += 1; offset += 1;
-            if maski % 4 == 0 {
-                advance_magic(&mut self.magic);
-                maski = 0;
-            }
-        }
-
-        if maski != 0 { return count; }
-
-        unsafe {
-            let len = (count - pre) / 4;
-            let dat = buf[..len*4].as_mut_ptr() as *mut u32;
-
-            for i in 0..(len as isize) {
-                *dat.offset(i) = *dat.offset(i) ^ advance_magic(&mut self.magic);
-            }
-
-            offset += len * 4;
-        }
-
-        for i in 0..(count%4) {
-            buf[offset + i] ^= ((self.magic >> (maski * 8)) & 0xff) as u8;
-            maski += 1;
-        }
-
-        return count;
+        count
     }
 }
 
