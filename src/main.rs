@@ -25,37 +25,22 @@ static E_INVALIDKEY: &str = "Key not found.";
 
 fn advance_magic(magic: &mut u32) -> u32 {
     let old = *magic;
-    *magic = magic.wrapping_mul(7) + 3;
-    return old;
+    *magic = magic.wrapping_mul(7).wrapping_add(3);
+    old
 }
 
 fn ru32(stream: &mut File, result: &mut u32) -> bool {
-    let mut buff = [0; 4];
-    if let Err(_) = stream.read_exact(&mut buff) {
+    let mut buf = [0; 4];
+    if stream.read_exact(&mut buf).is_err() {
         return false;
-    }
-
-    *result = (((buff[0] as u32) << 0x00) & 0x000000FF) |
-              (((buff[1] as u32) << 0x08) & 0x0000FF00) |
-              (((buff[2] as u32) << 0x10) & 0x00FF0000) |
-              (((buff[3] as u32) << 0x18) & 0xFF000000) ;
-
-    return true;
+    };
+    *result = u32::from_le_bytes(buf);
+    true
 }
 
 fn wu32(stream: &mut File, data: &u32) -> bool {
-    let mut buff = [0u8; 4];
-
-    buff[0] = (data & 0x000000FF) as u8;
-    buff[1] = ((data & 0x0000FF00) >> 0x08) as u8;
-    buff[2] = ((data & 0x00FF0000) >> 0x10) as u8;
-    buff[3] = ((data & 0xFF000000) >> 0x18) as u8;
-
-    if let Err(_) = stream.write_all(&buff[..]) {
-        return false;
-    }
-
-    return true;
+    let buf = data.to_le_bytes();
+    stream.write_all(&buf).is_ok()
 }
 
 /// Calls read until the buffer is full or EOF.
@@ -128,9 +113,12 @@ impl RGSSArchive {
             return Err(Error::new(ErrorKind::InvalidData, E_INVALIDVER));
         }
 
-        stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version]);
+        stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version])?;
 
-        Ok(RGSSArchive { magic: if version == 3 { 0u32 } else { 0xDEADCAFEu32 }, version: version, entry: HashMap::<String, EntryData>::new(), stream: stream })
+        let magic = if version == 3 { 0u32 } else { 0xDEADCAFEu32 };
+        let entry = HashMap::<String, EntryData>::new();
+
+        Ok(RGSSArchive { magic, version, entry, stream })
     }
 
     fn open(location: &str) -> Result<Self, Error> {
@@ -139,13 +127,8 @@ impl RGSSArchive {
         let mut header = [0u8; 8];
         stream.read_exact(&mut header)?;
 
-        match String::from_utf8(header[..6].to_vec()) {
-            Ok(h) => {
-                if h != "RGSSAD" {
-                    return Err(Error::new(ErrorKind::InvalidData, E_INVALIDHDR));
-                }
-            },
-            Err(_) => return Err(Error::new(ErrorKind::InvalidData, E_INVALIDHDR))
+        if &header[..6] != b"RGSSAD" {
+            return Err(Error::new(ErrorKind::InvalidData, E_INVALIDHDR));
         }
 
         // Check rgssad file version.
@@ -168,15 +151,15 @@ impl RGSSArchive {
             let mut name_buf = vec![0u8; name_len as usize];
             stream.read_exact(&mut name_buf)?;
             for i in 0..(name_len as usize) {
-                name_buf[i] ^= (advance_magic(&mut magic) & 0xff) as u8;
-                if name_buf[i] == '\\' as u8 { name_buf[i] = '/' as u8 }
+                name_buf[i] ^= advance_magic(&mut magic) as u8;
+                if name_buf[i] == b'\\' { name_buf[i] = b'/' }
             }
             let name_buf = String::from_utf8(name_buf);
-            if let Err(_) = name_buf { break }
+            if name_buf.is_err() { break }
             let name_buf = name_buf.unwrap();
 
             let mut data = EntryData { size: 0, offset: 0, magic: 0 };
-            ru32(&mut stream, &mut data.size);
+            if !ru32(&mut stream, &mut data.size) { break }
             data.size ^= advance_magic(&mut magic);
             data.offset = stream.seek(SeekFrom::Current(0))? as u32;
             data.magic = magic;
@@ -186,7 +169,7 @@ impl RGSSArchive {
         }
 
         stream.seek(SeekFrom::Start(0))?;
-        return Ok(RGSSArchive { magic: magic, version: version, entry: entry, stream: stream });
+        Ok(RGSSArchive { magic, version, entry, stream })
     }
 
     fn open_rgss3a(mut stream: File, version: u8) -> Result<Self, Error> {
@@ -196,7 +179,7 @@ impl RGSSArchive {
         if !ru32(&mut stream, &mut magic) {
             return Err(Error::new(ErrorKind::InvalidData, E_INVALIDMGC));
         }
-        magic = magic * 9 + 3;
+        magic = magic.wrapping_mul(9).wrapping_add(3);
 
         loop {
             let mut offset: u32 = 0;
@@ -221,22 +204,20 @@ impl RGSSArchive {
             let mut name_buf = vec![0u8; name_len as usize];
             stream.read_exact(&mut name_buf)?;
             for i in 0..(name_len as usize) {
-                name_buf[i] ^= ((magic >> 8*(i%4)) & 0xff) as u8;
-                if name_buf[i] == '\\' as u8 { name_buf[i] = '/' as u8 }
+                name_buf[i] ^= (magic >> 8*(i%4)) as u8;
+                if name_buf[i] == b'\\' { name_buf[i] = b'/' }
             }
             let name_buf = String::from_utf8(name_buf);
-            if let Err(_) = name_buf { break }
+            if name_buf.is_err() { break }
             let name_buf = name_buf.unwrap();
 
-            let data = EntryData {
-                size: size, offset: offset, magic: start_magic
-            };
+            let data = EntryData { size, offset, magic: start_magic };
 
             entry.insert(name_buf, data);
         }
 
         stream.seek(SeekFrom::Start(0))?;
-        return Ok(RGSSArchive {magic: magic, version: version, entry: entry, stream: stream });
+        Ok(RGSSArchive { magic, version, entry, stream })
     }
 
     fn get_key(&self, key: &str) -> Result<Entry, Error> {
@@ -313,7 +294,7 @@ fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
     fn create(location: String) -> File {
         let path = Path::new(location.as_str());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        return File::create(path.to_str().unwrap()).unwrap();
+        File::create(path.to_str().unwrap()).unwrap()
     }
 
     let entries = archive.entry.iter();
@@ -336,7 +317,7 @@ fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
         }
         let mut entry = entry.unwrap();
 
-        let mut file = create(dir.to_string() + &"/".to_string() + &name.to_string());
+        let mut file = create(format!("{}/{}", dir, name));
         loop {
             let count = entry.read(&mut buf);
             if count == 0 { break }
