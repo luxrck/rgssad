@@ -4,7 +4,6 @@ use std::io::SeekFrom;
 use std::io::Seek;
 use std::io::Read;
 use std::io::Write;
-use std::io::Take;
 use std::io::Error;
 use std::io::ErrorKind;
 use std::collections::HashMap;
@@ -20,7 +19,6 @@ static __VERSION__: &str = "0.1.4";
 static E_INVALIDHDR: &str = "Input file header mismatch.";
 static E_INVALIDVER: &str = "Not supported version.";
 static E_INVALIDMGC: &str = "Magic number read failed.";
-static E_INVALIDKEY: &str = "Key not found.";
 
 
 fn advance_magic(magic: &mut u32) -> u32 {
@@ -44,7 +42,7 @@ fn wu32(stream: &mut File, data: &u32) -> bool {
 }
 
 /// Calls read until the buffer is full or EOF.
-fn read_until_full(stream: &mut Take<File>, buf: &mut [u8]) -> Result<usize, Error> {
+fn read_until_full(stream: &mut File, buf: &mut [u8]) -> Result<usize, Error> {
     let mut nb = 0;
     loop {
         match stream.read(&mut buf[nb..]) {
@@ -63,38 +61,46 @@ struct EntryData {
 }
 
 
-struct Entry {
-    offset: u32,
-    magic: u32,
-    stream: Take<File>,
+struct Coder {
+    buf: Vec<u8>,
 }
 
-impl Entry {
-    fn write(&mut self, buf: &Take<File>) {
+impl Coder {
+    /// Encrypts/decrypts file data from stream_in to stream_out.
+    fn copy(
+        &mut self,
+        stream_in: &mut File,
+        stream_out: &mut File,
+        data: &EntryData,
+    ) -> Result<(), Error> {
+        assert!(self.buf.len() % 4 == 0); // needed for alignment
 
-    }
+        stream_in.seek(SeekFrom::Start(data.offset as u64))?;
 
-    fn read(&mut self, buf: &mut [u8]) -> usize {
-        let count = read_until_full(&mut self.stream, buf).unwrap();
-        if count == 0 { return 0; }
-        let buf = &mut buf[..count];
+        let mut magic = data.magic;
+        let mut size = data.size; // remaining bytes to read
+        loop {
+            let limit = self.buf.len().min(size as usize);
+            let count = read_until_full(stream_in, &mut self.buf[..limit])?;
+            if count == 0 { return Ok(()) }
+            let buf = &mut self.buf[..count];
 
-        let (prefix, middle, suffix) = unsafe { buf.align_to_mut::<u32>() };
-        assert!(prefix.len() == 0); // assume buf is aligned
-        assert!(self.offset % 4 == 0);
+            let (prefix, middle, suffix) = unsafe { buf.align_to_mut::<u32>() };
+            assert!(prefix.len() == 0); // assume buf is aligned
 
-        for i in 0..middle.len() {
-            let mut w = u32::from_le(middle[i]);
-            w ^= advance_magic(&mut self.magic);
-            middle[i] = w.to_le();
+            for i in 0..middle.len() {
+                let mut w = u32::from_le(middle[i]);
+                w ^= advance_magic(&mut magic);
+                middle[i] = w.to_le();
+            }
+
+            for i in 0..suffix.len() {
+                suffix[i] ^= (magic >> (i * 8)) as u8;
+            }
+
+            size -= count as u32;
+            stream_out.write_all(buf)?;
         }
-
-        for i in 0..suffix.len() {
-            suffix[i] ^= (self.magic >> (i * 8)) as u8;
-        }
-
-        self.offset += count as u32;
-        count
     }
 }
 
@@ -220,21 +226,6 @@ impl RGSSArchive {
         Ok(RGSSArchive { magic, version, entry, stream })
     }
 
-    fn get_key(&self, key: &str) -> Result<Entry, Error> {
-        match self.entry.get(key) {
-            Some(entry) => {
-                let mut stream = self.stream.try_clone()?;
-                stream.seek(SeekFrom::Start(entry.offset as u64))?;
-                Ok(Entry {
-                    offset: 0,
-                    magic: entry.magic,
-                    stream: stream.take(entry.size as u64),
-                })
-            }
-            None => Err(Error::new(ErrorKind::InvalidData, E_INVALIDKEY)),
-        }
-    }
-
     // fn put_key(&self, key: &str, stream: &mut File) -> Result<Entry, Error> {
     //     match self.version {
     //         1|2 => self.put_key_rgssad(stream),
@@ -290,7 +281,7 @@ fn pack(src: &str, out: &str, version: u8) {
     walkdir(&mut archive, root, root);
 }
 
-fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
+fn unpack(mut archive: RGSSArchive, dir: &str, filter: &str) {
     fn create(location: String) -> File {
         let path = Path::new(location.as_str());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -305,25 +296,16 @@ fn unpack(archive: RGSSArchive, dir: &str, filter: &str) {
         }
     };
 
-    let mut buf = [0u8; 8192];
+    let mut coder = Coder { buf: vec![0u8; 8192] };
 
-    for (name, _) in entries {
+    for (name, data) in entries {
         if !filter.is_match(name) { continue }
 
         println!("Extracting: {}", name);
-        let entry = archive.get_key(name);
-        if let Err(err) = entry {
-            println!("FAILED: read entry failed, {}", err.to_string()); return;
-        }
-        let mut entry = entry.unwrap();
 
         let mut file = create(format!("{}/{}", dir, name));
-        loop {
-            let count = entry.read(&mut buf);
-            if count == 0 { break }
-            if let Err(err) = file.write(&buf[..count]) {
-                println!("FAILED: key save failed, {}", err.to_string()); return;
-            }
+        if let Err(err) = coder.copy(&mut archive.stream, &mut file, data) {
+            println!("FAILED: key save failed, {}", err.to_string()); return
         }
     }
 }
