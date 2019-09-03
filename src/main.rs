@@ -17,7 +17,7 @@ static __VERSION__: &str = "0.1.4";
 
 // Errors
 static E_INVALIDHDR: &str = "Input file header mismatch.";
-static E_INVALIDVER: &str = "Not supported version.";
+static E_INVALIDVER: &str = "Not supported version (must be 1-3).";
 static E_INVALIDMGC: &str = "Magic number read failed.";
 
 
@@ -34,7 +34,7 @@ fn ru32(stream: &mut File, result: &mut u32) -> Result<(), Error> {
     Ok(())
 }
 
-fn wu32(stream: &mut File, data: &u32) -> Result<(), Error> {
+fn wu32(stream: &mut File, data: u32) -> Result<(), Error> {
     let buf = data.to_le_bytes();
     stream.write_all(&buf)
 }
@@ -57,7 +57,6 @@ struct EntryData {
     magic: u32,
     size: u32,
 }
-
 
 struct Coder {
     buf: Vec<u8>,
@@ -121,7 +120,7 @@ impl RGSSArchive {
             return Err(Error::new(ErrorKind::InvalidData, E_INVALIDVER));
         }
 
-        stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version])?;
+        stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', b'\0', version])?;
 
         let magic = if version == 3 { 0u32 } else { 0xDEADCAFEu32 };
         let entry = vec![];
@@ -140,7 +139,7 @@ impl RGSSArchive {
         }
 
         // Check rgssad file version.
-        return match header[7] {
+        match header[7] {
             1|2 => RGSSArchive::open_rgssad(stream, header[7]),
               3 => RGSSArchive::open_rgss3a(stream, header[7]),
               _ => Err(Error::new(ErrorKind::InvalidData, E_INVALIDVER)),
@@ -203,7 +202,7 @@ impl RGSSArchive {
             if ru32(&mut stream, &mut size).is_err() { break }
             size ^= magic;
 
-            if ru32(&mut stream, &mut start_magic).is_err() { break}
+            if ru32(&mut stream, &mut start_magic).is_err() { break }
             start_magic ^= magic;
 
             if ru32(&mut stream, &mut name_len).is_err() { break }
@@ -228,12 +227,116 @@ impl RGSSArchive {
         Ok(RGSSArchive { magic, version, entry, stream })
     }
 
-    // fn put_key(&self, key: &str, stream: &mut File) -> Result<Entry, Error> {
-    //     match self.version {
-    //         1|2 => self.put_key_rgssad(stream),
-    //           3 => self.put_key_rgss3a(stream),
-    //     }
-    // }
+    fn write_entries(&mut self, root: &Path) -> Result<(), Error> {
+        match self.version {
+            1|2 => self.write_entries_rgssad(root),
+              3 => self.write_entries_rgss3a(root),
+              _ => Err(Error::new(ErrorKind::InvalidData, E_INVALIDVER)),
+        }
+    }
+
+    fn write_entries_rgssad(&mut self, root: &Path) -> Result<(), Error> {
+        let mut coder = Coder { buf: vec![0u8; 8192] };
+
+        for &Entry { ref name, ref data } in &self.entry {
+            println!("Packing: {}", name);
+
+            let mut name_len: u32 = name.len().try_into().unwrap();
+            name_len ^= advance_magic(&mut self.magic);
+            wu32(&mut self.stream, name_len)?;
+
+            let mut name_buf = name.as_bytes().to_vec();
+            for i in 0..name_buf.len() {
+                if name_buf[i] == b'/' { name_buf[i] = b'\\' }
+                name_buf[i] ^= advance_magic(&mut self.magic) as u8;
+            }
+            self.stream.write_all(&name_buf)?;
+
+            let mut size = data.size;
+            size ^= advance_magic(&mut self.magic);
+            wu32(&mut self.stream, size)?;
+
+            let mut file = File::open(root.join(name))?;
+            coder.copy(
+                &mut file,
+                &mut self.stream,
+                &EntryData {
+                    offset: 0,
+                    size: data.size,
+                    magic: self.magic,
+                }
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn write_entries_rgss3a(&mut self, root: &Path) -> Result<(), Error> {
+        // Layout is
+        //   +------+-----+-------+------+------+---+------+
+        //   |Header|Magic|Entries|File 1|File 2|...|File n|
+        //   +------+-----+-------+------+------+---+------+
+
+        // First calculate the offset to the end of Entries
+
+        let mut off: u32 = 8 + 4;  // Header + Magic
+        for &Entry { ref name, .. } in &self.entry {
+            // Each entry is 16 bytes + length of name
+            let name_len: u32 = name.len().try_into().unwrap();
+            off = off.checked_add(name_len).unwrap();
+            off = off.checked_add(16).unwrap();
+        }
+        off = off.checked_add(4).unwrap(); // terminates entry list
+
+        // Next calculate the offset for each entry.
+
+        for entry in &mut self.entry {
+            entry.data.offset = off;
+            off = off.checked_add(entry.data.size).unwrap();
+
+            // Also pick a magic for each entry. We can chose freely?
+            entry.data.magic = 0xDEADCAFEu32;
+        }
+
+        // Finally write it all out.
+
+        wu32(&mut self.stream, self.magic)?;
+        self.magic = self.magic.wrapping_mul(9).wrapping_add(3);
+
+        for &Entry { ref name, ref data } in &self.entry {
+            wu32(&mut self.stream, data.offset ^ self.magic)?;
+            wu32(&mut self.stream, data.size ^ self.magic)?;
+            wu32(&mut self.stream, data.magic ^ self.magic)?;
+            wu32(&mut self.stream, name.len() as u32 ^ self.magic)?;
+
+            let mut name_buf = name.as_bytes().to_vec();
+            for i in 0..name_buf.len() {
+                if name_buf[i] == b'/' { name_buf[i] = b'\\' }
+                name_buf[i] ^= (self.magic >> 8*(i%4)) as u8;
+            }
+            self.stream.write_all(&name_buf)?;
+        }
+        wu32(&mut self.stream, 0u32 ^ self.magic)?;
+
+        let mut coder = Coder { buf: vec![0u8; 8192] };
+
+        for &Entry { ref name, ref data } in &self.entry {
+            println!("Packing: {}", name);
+
+            let mut file = File::open(root.join(name))?;
+            coder.copy(
+                &mut file,
+                &mut self.stream,
+                &EntryData {
+                    offset: 0,
+                    size: data.size,
+                    magic: data.magic,
+                }
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 
@@ -242,8 +345,9 @@ fn usage() {
 Commands:
     help
     version
-    list        <filename>
-    unpack      <filename> <location> [<filter>]");
+    list        <archive>
+    unpack      <archive> <folder> [<filter>]
+    pack        <folder> <archive> [<version>]");
 }
 
 fn list(archive: RGSSArchive) {
@@ -290,7 +394,9 @@ fn pack(src: &str, out: &str, version: u8) {
     // First pass: collect file names and sizes
     walkdir(&mut archive, root, root);
     // Second pass: write file data.
-    //archive.write_entries()
+    if let Err(e) = archive.write_entries(root) {
+        println!("FAILED: unable to write archive. {}", e); return
+    }
 }
 
 fn unpack(mut archive: RGSSArchive, dir: &str, filter: &str) {
@@ -352,7 +458,13 @@ fn main() {
         },
         "pack" => {
             assert!(args.len() > 3 && args.len() < 6);
-            let mut version = 1u8;
+            let mut version = if args[3].ends_with(".rgss3a") {
+                3
+            } else if args[3].ends_with(".rgss2a") {
+                2
+            } else {
+                1
+            };
             if args.len() == 5 {
                 version = match args[4].parse() {
                     Ok(v) => v,
