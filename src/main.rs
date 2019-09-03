@@ -6,9 +6,9 @@ use std::io::Read;
 use std::io::Write;
 use std::io::Error;
 use std::io::ErrorKind;
-use std::collections::HashMap;
 use std::env;
 use std::path::Path;
+use std::convert::TryInto;
 
 extern crate regex;
 use regex::Regex;
@@ -27,18 +27,16 @@ fn advance_magic(magic: &mut u32) -> u32 {
     old
 }
 
-fn ru32(stream: &mut File, result: &mut u32) -> bool {
+fn ru32(stream: &mut File, result: &mut u32) -> Result<(), Error> {
     let mut buf = [0; 4];
-    if stream.read_exact(&mut buf).is_err() {
-        return false;
-    };
+    stream.read_exact(&mut buf)?;
     *result = u32::from_le_bytes(buf);
-    true
+    Ok(())
 }
 
-fn wu32(stream: &mut File, data: &u32) -> bool {
+fn wu32(stream: &mut File, data: &u32) -> Result<(), Error> {
     let buf = data.to_le_bytes();
-    stream.write_all(&buf).is_ok()
+    stream.write_all(&buf)
 }
 
 /// Calls read until the buffer is full or EOF.
@@ -104,11 +102,15 @@ impl Coder {
     }
 }
 
+struct Entry {
+    name: String,
+    data: EntryData,
+}
 
 struct RGSSArchive {
     magic: u32,
     version: u8,
-    entry: HashMap<String, EntryData>,
+    entry: Vec<Entry>,
     stream: File,
 }
 
@@ -122,7 +124,7 @@ impl RGSSArchive {
         stream.write_all(&[b'R', b'G', b'S', b'S', b'A', b'D', version])?;
 
         let magic = if version == 3 { 0u32 } else { 0xDEADCAFEu32 };
-        let entry = HashMap::<String, EntryData>::new();
+        let entry = vec![];
 
         Ok(RGSSArchive { magic, version, entry, stream })
     }
@@ -147,31 +149,31 @@ impl RGSSArchive {
 
     fn open_rgssad(mut stream: File, version: u8) -> Result<Self, Error> {
         let mut magic = 0xDEADCAFEu32;
-        let mut entry = HashMap::new();
+        let mut entry = vec![];
 
         loop {
             let mut name_len: u32 = 0;
-            if !ru32(&mut stream, &mut name_len) { break }
+            if ru32(&mut stream, &mut name_len).is_err() { break }
             name_len ^= advance_magic(&mut magic);
 
-            let mut name_buf = vec![0u8; name_len as usize];
-            stream.read_exact(&mut name_buf)?;
+            let mut name = vec![0u8; name_len as usize];
+            stream.read_exact(&mut name)?;
             for i in 0..(name_len as usize) {
-                name_buf[i] ^= advance_magic(&mut magic) as u8;
-                if name_buf[i] == b'\\' { name_buf[i] = b'/' }
+                name[i] ^= advance_magic(&mut magic) as u8;
+                if name[i] == b'\\' { name[i] = b'/' }
             }
-            let name_buf = String::from_utf8(name_buf);
-            if name_buf.is_err() { break }
-            let name_buf = name_buf.unwrap();
+            let name = String::from_utf8(name);
+            if name.is_err() { break }
+            let name = name.unwrap();
 
             let mut data = EntryData { size: 0, offset: 0, magic: 0 };
-            if !ru32(&mut stream, &mut data.size) { break }
+            if ru32(&mut stream, &mut data.size).is_err() { break }
             data.size ^= advance_magic(&mut magic);
             data.offset = stream.seek(SeekFrom::Current(0))? as u32;
             data.magic = magic;
 
             stream.seek(SeekFrom::Current(data.size as i64))?;
-            entry.insert(name_buf, data);
+            entry.push(Entry { name, data });
         }
 
         stream.seek(SeekFrom::Start(0))?;
@@ -180,9 +182,9 @@ impl RGSSArchive {
 
     fn open_rgss3a(mut stream: File, version: u8) -> Result<Self, Error> {
         let mut magic = 0u32;
-        let mut entry = HashMap::new();
+        let mut entry = vec![];
 
-        if !ru32(&mut stream, &mut magic) {
+        if ru32(&mut stream, &mut magic).is_err() {
             return Err(Error::new(ErrorKind::InvalidData, E_INVALIDMGC));
         }
         magic = magic.wrapping_mul(9).wrapping_add(3);
@@ -193,33 +195,33 @@ impl RGSSArchive {
             let mut start_magic: u32 = 0;
             let mut name_len: u32 = 0;
 
-            if !ru32(&mut stream, &mut offset) { break };
+            if ru32(&mut stream, &mut offset).is_err() { break };
             offset ^= magic;
 
             if offset == 0 { break }
 
-            if !ru32(&mut stream, &mut size) { break }
+            if ru32(&mut stream, &mut size).is_err() { break }
             size ^= magic;
 
-            if !ru32(&mut stream, &mut start_magic) { break}
+            if ru32(&mut stream, &mut start_magic).is_err() { break}
             start_magic ^= magic;
 
-            if !ru32(&mut stream, &mut name_len) { break }
+            if ru32(&mut stream, &mut name_len).is_err() { break }
             name_len ^= magic;
 
-            let mut name_buf = vec![0u8; name_len as usize];
-            stream.read_exact(&mut name_buf)?;
+            let mut name = vec![0u8; name_len as usize];
+            stream.read_exact(&mut name)?;
             for i in 0..(name_len as usize) {
-                name_buf[i] ^= (magic >> 8*(i%4)) as u8;
-                if name_buf[i] == b'\\' { name_buf[i] = b'/' }
+                name[i] ^= (magic >> 8*(i%4)) as u8;
+                if name[i] == b'\\' { name[i] = b'/' }
             }
-            let name_buf = String::from_utf8(name_buf);
-            if name_buf.is_err() { break }
-            let name_buf = name_buf.unwrap();
+            let name = String::from_utf8(name);
+            if name.is_err() { break }
+            let name = name.unwrap();
 
             let data = EntryData { size, offset, magic: start_magic };
 
-            entry.insert(name_buf, data);
+            entry.push(Entry { name, data });
         }
 
         stream.seek(SeekFrom::Start(0))?;
@@ -245,7 +247,7 @@ Commands:
 }
 
 fn list(archive: RGSSArchive) {
-    for (name, data) in archive.entry {
+    for Entry { name, data } in archive.entry {
         println!("{}: EntryData {{ size: {}, offset: {}, magic: {} }}", name, data.size, data.offset, data.magic);
     }
 }
@@ -258,11 +260,18 @@ fn pack(src: &str, out: &str, version: u8) {
             if path.is_dir() {
                 walkdir(archive, &path, r);
             } else {
-                let key = path.strip_prefix(r).unwrap().to_str().unwrap();
-                let mut stream = File::open(&path).unwrap();
+                let name = path.strip_prefix(r).unwrap().to_str().unwrap();
+                let size = fs::metadata(&path).unwrap().len();
+                let size: u32 = size.try_into().unwrap();
 
-                // TODO: implement this.
-                //archive.put_key(key, stream);
+                archive.entry.push(Entry {
+                    name: name.to_string(),
+                    data: EntryData {
+                        size,
+                        offset: 0, // calculated later
+                        magic: 0, // calculated later
+                    }
+                });
             }
         }
     };
@@ -278,7 +287,10 @@ fn pack(src: &str, out: &str, version: u8) {
             println!("FAILED: unable to create output file. {}", e); return
         }
     };
+    // First pass: collect file names and sizes
     walkdir(&mut archive, root, root);
+    // Second pass: write file data.
+    //archive.write_entries()
 }
 
 fn unpack(mut archive: RGSSArchive, dir: &str, filter: &str) {
@@ -298,7 +310,7 @@ fn unpack(mut archive: RGSSArchive, dir: &str, filter: &str) {
 
     let mut coder = Coder { buf: vec![0u8; 8192] };
 
-    for (name, data) in entries {
+    for Entry { name, data } in entries {
         if !filter.is_match(name) { continue }
 
         println!("Extracting: {}", name);
