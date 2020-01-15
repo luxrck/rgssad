@@ -13,7 +13,7 @@ use std::convert::TryInto;
 extern crate regex;
 use regex::Regex;
 
-static __VERSION__: &str = "0.1.4";
+static __VERSION__: &str = env!("CARGO_PKG_VERSION");
 
 // Errors
 static E_INVALIDHDR: &str = "Input file header mismatch.";
@@ -382,20 +382,20 @@ fn pack(src: &str, out: &str, version: u8) {
 
     let root = Path::new(src);
     if !root.is_dir() {
-        println!("FAILED: source is not a directory."); return
+        eprintln!("FAILED: source is not a directory."); return
     }
 
     let mut archive = match RGSSArchive::create(out, version) {
         Ok(x) => x,
         Err(e) => {
-            println!("FAILED: unable to create output file. {}", e); return
+            eprintln!("FAILED: unable to create output file. {}", e); return
         }
     };
     // First pass: collect file names and sizes
     walkdir(&mut archive, root, root);
     // Second pass: write file data.
     if let Err(e) = archive.write_entries(root) {
-        println!("FAILED: unable to write archive. {}", e); return
+        eprintln!("FAILED: unable to write archive. {}", e); return
     }
 }
 
@@ -410,7 +410,7 @@ fn unpack(mut archive: RGSSArchive, dir: &str, filter: &str) {
     let filter = match Regex::new(filter) {
         Ok(re) => re,
         Err(_) => {
-            println!("FAILED: Invalid regex filter: {}", filter); return
+            eprintln!("FAILED: Invalid regex filter: {}", filter); return
         }
     };
 
@@ -423,7 +423,7 @@ fn unpack(mut archive: RGSSArchive, dir: &str, filter: &str) {
 
         let mut file = create(format!("{}/{}", dir, name));
         if let Err(err) = coder.copy(&mut archive.stream, &mut file, data) {
-            println!("FAILED: key save failed, {}", err.to_string()); return
+            eprintln!("FAILED: key save failed, {}", err.to_string()); return
         }
     }
 }
@@ -441,7 +441,7 @@ fn main() {
             assert!(args.len() == 3);
             let archive = RGSSArchive::open(args[2].as_str());
             if let Err(err) = archive {
-                println!("FAILED: file parse failed, {}", err.to_string()); return;
+                eprintln!("FAILED: file parse failed, {}", err.to_string()); return;
             }
             let archive = archive.unwrap();
 
@@ -451,7 +451,7 @@ fn main() {
             assert!(args.len() > 3 && args.len() < 6);
             let archive = RGSSArchive::open(args[2].as_str());
             if let Err(err) = archive {
-                println!("FAILED: file parse failed, {}", err.to_string()); return;
+                eprintln!("FAILED: file parse failed, {}", err.to_string()); return;
             }
             let archive = archive.unwrap();
             unpack(archive, args[3].as_str(), if args.len() == 5 { args[4].as_str() } else { ".*" });
@@ -469,7 +469,7 @@ fn main() {
                 version = match args[4].parse() {
                     Ok(v) => v,
                     Err(_) => {
-                        println!("FAILED: {}", E_INVALIDVER); return
+                        eprintln!("FAILED: {}", E_INVALIDVER); return
                     }
                 }
             };
